@@ -6,7 +6,7 @@ module Main where
 import qualified Graphics.Gloss as G
 import qualified Graphics.Gloss.Interface.Pure.Game as G
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Array, Comp(..), B, D, S, Ix2(..), (!), Sz(..))
+import Data.Massiv.Array (Array, Comp(..), S, Ix2(..), (!), Sz(..))
 import qualified Data.Massiv.Array.Numeric as M
 import Control.Monad (forM_, replicateM)
 import System.Random (randomRIO)
@@ -42,6 +42,7 @@ data World = World
     , currentStage :: Stage
     , mousePos :: (Float, Float)
     , isDrawing :: Bool
+    , shouldProcess :: Bool
     }
 
 data Stage = Drawing | Conv1 | Conv2 | FullyConnected | Prediction
@@ -116,7 +117,8 @@ drawAtPoint (x, y) arr =
 
 renderDrawingStage :: Array S Ix2 Float -> G.Picture
 renderDrawingStage img = 
-    G.scale 20 20 $ G.pictures 
+    G.translate (-280.0) (-280.0) $
+    G.scale 20.0 20.0 $ G.pictures 
         [G.translate (fromIntegral x) (fromIntegral y) $ 
          G.color (G.makeColor 0 0 0 (img ! Ix2 y x)) $
          G.rectangleSolid 1 1
@@ -127,12 +129,11 @@ renderFeatureMaps features =
     let n = length features
         cols = ceiling (sqrt (fromIntegral n :: Double)) :: Int
         rows = ceiling ((fromIntegral n :: Double) / fromIntegral cols) :: Int
-        scale = min (600 / fromIntegral rows) 
-                   (800 / fromIntegral cols)
+        scale = min (600.0 / fromIntegral rows) (800.0 / fromIntegral cols)
         positions = [(fromIntegral x, fromIntegral y) | y <- [0..rows-1], x <- [0..cols-1]]
     in G.pictures 
-        [G.translate (x * scale - 400) (y * scale - 300) $
-         G.scale (scale/28) (scale/28) $
+        [G.translate (x * scale - 400.0) (y * scale - 300.0) $
+         G.scale (scale/28.0) (scale/28.0) $
          renderFeatureMap f
         | (f, (x, y)) <- zip features positions]
 
@@ -143,36 +144,37 @@ renderFeatureMap feature =
          G.color (G.makeColor v v v 1) $
          G.rectangleSolid 1 1
         | x <- [0..27], y <- [0..27]
-        , let v = min 1 $ max 0 $ feature ! Ix2 y x]
+        , let v = min 1.0 $ max 0.0 $ feature ! Ix2 y x]
 
 renderFullyConnected :: [Float] -> G.Picture
 renderFullyConnected activations =
     let n = length activations
-        width = 800
-        height = 600
+        width = 800.0
+        height = 600.0
         spacing = width / fromIntegral n
     in G.pictures 
-        [G.translate (x * spacing - width/2) 0 $
+        [G.translate (x * spacing - width/2.0) 0 $
          G.color (G.makeColor v v v 1) $
-         G.circleSolid 10
-        | (v, x) <- zip activations [0..]]
+         G.circleSolid 10.0
+        | (v, x) <- zip activations [0.0, spacing .. width - spacing]]
 
 renderPrediction :: [Float] -> G.Picture
 renderPrediction probs =
-    let barWidth = 60
-        spacing = 20
-        totalWidth = (barWidth + spacing) * 10
-        maxHeight = 500
-    in G.translate (-totalWidth/2) (-250) $ G.pictures
+    let barWidth = 60.0
+        spacing = 20.0
+        totalWidth = (barWidth + spacing) * 10.0
+        maxHeight = 500.0
+    in G.translate (-totalWidth/2.0) (-250.0) $ G.pictures
         [G.translate (fromIntegral i * (barWidth + spacing)) 0 $
          G.pictures
             [G.color G.blue $
              G.rectangleSolid barWidth (p * maxHeight),
-             G.translate 0 (-30) $
+             G.translate 0 (-30.0) $
              G.scale 0.1 0.1 $
              G.text (show i)]
         | (p, i) <- zip probs [0..9]]
 
+handleEvent :: G.Event -> World -> World
 handleEvent (G.EventKey (G.Char key) G.Down _ _) world@World{..} =
     case key of
         '1' -> world { currentStage = Drawing }
@@ -180,7 +182,8 @@ handleEvent (G.EventKey (G.Char key) G.Down _ _) world@World{..} =
         '3' -> world { currentStage = Conv2 }
         '4' -> world { currentStage = FullyConnected }
         '5' -> world { currentStage = Prediction }
-        'c' -> world { inputImage = M.makeArray M.Seq (M.Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float }
+        'c' -> world { inputImage = M.makeArray M.Seq (Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float }
+        'p' -> world { shouldProcess = True }
 handleEvent (G.EventKey (G.MouseButton G.LeftButton) G.Down _ pos) world =
     world { isDrawing = True, mousePos = pos }
 handleEvent (G.EventKey (G.MouseButton G.LeftButton) G.Up _ _) world =
@@ -192,17 +195,17 @@ handleEvent (G.EventMotion pos) world@World{..} =
 handleEvent _ world = world
 
 update :: Float -> World -> World
-update _ world@World{..} =
-    if isDrawing
-    then let newImage = drawAtPoint mousePos inputImage
-             (c1, c2, fc, out) = forwardPass network newImage
-         in world { inputImage = newImage
-                 , conv1Features = c1
-                 , conv2Features = c2
-                 , fcFeatures = fc
-                 , outputFeatures = out
-                 }
-    else world
+update _ world@World{..}
+    | shouldProcess = let (c1, c2, fc, out) = forwardPass network inputImage
+                      in world { conv1Features = c1
+                               , conv2Features = c2
+                               , fcFeatures = fc
+                               , outputFeatures = out
+                               , shouldProcess = False
+                               }
+    | isDrawing = let newImage = drawAtPoint mousePos inputImage
+                  in world { inputImage = newImage }
+    | otherwise = world
 
 render :: World -> G.Picture
 render World{..} = case currentStage of
@@ -215,13 +218,13 @@ render World{..} = case currentStage of
 getConvKernel :: Int -> Int -> Get (Array S Ix2 Float)
 getConvKernel h w = do
     values <- replicateM (h * w) getFloatle
-    return $ M.makeArray M.Seq (M.Sz (Ix2 h w)) $ \(Ix2 i j) ->
+    return $ M.makeArray M.Seq (Sz (Ix2 h w)) $ \(Ix2 i j) ->
         values !! (i * w + j)
 
 getArray2D :: Int -> Int -> Get (Array S Ix2 Float)
 getArray2D h w = do
     values <- replicateM (h * w) getFloatle
-    return $ M.makeArray M.Seq (M.Sz (Ix2 h w)) $ \(Ix2 i j) ->
+    return $ M.makeArray M.Seq (Sz (Ix2 h w)) $ \(Ix2 i j) ->
         values !! (i * w + j)
 
 loadNetwork :: FilePath -> IO (Either String Network)
@@ -255,7 +258,7 @@ main = do
     case netResult of
         Left err -> putStrLn $ "Failed to load network: " ++ err
         Right net -> do
-            let initialImage = M.makeArray M.Seq (M.Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float
+            let initialImage = M.makeArray M.Seq (Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float
                 world = World {
                     inputImage = initialImage,
                     conv1Features = [],
@@ -265,7 +268,8 @@ main = do
                     network = net,
                     currentStage = Drawing,
                     mousePos = (0, 0),
-                    isDrawing = False
+                    isDrawing = False,
+                    shouldProcess = False
                 }
             G.play
                 (G.InWindow "CNN Visualization" (800, 600) (100, 100))
