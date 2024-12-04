@@ -6,7 +6,7 @@ module Main where
 import qualified Graphics.Gloss as G
 import qualified Graphics.Gloss.Interface.Pure.Game as G
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Array, Comp(..), S, Ix2(..), (!), Sz(..))
+import Data.Massiv.Array (Array, Comp(..), S, Ix2(..), Ix3(..), (!), Sz(..))
 import qualified Data.Massiv.Array.Numeric as M
 import Control.Monad (forM_, replicateM)
 import System.Random (randomRIO)
@@ -24,7 +24,7 @@ type Layer = Array S Ix2 Float
 data Network = Network 
     { conv1Weights :: [Array S Ix2 Weight]
     , conv1Biases :: [Bias]
-    , conv2Weights :: [Array S Ix2 Weight]
+    , conv2Weights :: [Array S Ix3 Weight]  -- 3D kernels for second convolution
     , conv2Biases :: [Bias]
     , fcWeights :: Array S Ix2 Weight
     , fcBiases :: [Bias]
@@ -35,7 +35,9 @@ data Network = Network
 data World = World
     { inputImage :: Array S Ix2 Float
     , conv1Features :: [Array S Ix2 Float]
+    , pool1Features :: [Array S Ix2 Float]
     , conv2Features :: [Array S Ix2 Float]
+    , pool2Features :: [Array S Ix2 Float]
     , fcFeatures :: [Float]
     , outputFeatures :: [Float]
     , network :: Network
@@ -43,9 +45,12 @@ data World = World
     , mousePos :: (Float, Float)
     , isDrawing :: Bool
     , shouldProcess :: Bool
+    , stageIndex :: Int
+    , stages :: [Stage]  -- Added stages to World
+    , stageDescriptions :: [String]
     }
 
-data Stage = Drawing | Conv1 | Conv2 | FullyConnected | Prediction
+data Stage = Drawing | Conv1 | Pool1 | Conv2 | Pool2 | FullyConnected | Prediction
     deriving (Eq, Show)
 
 -- Neural Network Operations
@@ -72,9 +77,36 @@ convolve input kernel =
             , j' >= 0, j' < w
             ]
 
+convolve3D :: Array S Ix3 Float -> Array S Ix3 Float -> Array S Ix2 Float
+convolve3D input kernel =
+    let M.Sz (M.Ix3 d h w) = M.size input
+        M.Sz (M.Ix3 dk kh kw) = M.size kernel
+        outputH = h - kh + 1
+        outputW = w - kw + 1
+        get_pixel c i j = input ! M.Ix3 c i j
+        get_kernel c i j = kernel ! M.Ix3 c i j
+    in M.makeArray M.Seq (Sz (Ix2 outputH outputW)) $ \(Ix2 i j) ->
+        sum [ get_pixel c (i + ki) (j + kj) * get_kernel c ki kj
+            | c <- [0..dk-1]
+            , ki <- [0..kh-1]
+            , kj <- [0..kw-1]
+            ]
+
 convLayer :: [Array S Ix2 Float] -> [Bias] -> Array S Ix2 Float -> [Array S Ix2 Float]
 convLayer weights biases input = 
     zipWith (\w b -> M.computeS $ M.map (relu . (+b)) $ convolve input w) weights biases
+
+convLayer3D :: [Array S Ix3 Float] -> [Bias] -> Array S Ix3 Float -> [Array S Ix2 Float]
+convLayer3D weights biases input = 
+    zipWith (\w b -> M.computeS $ M.map (relu . (+b)) $ convolve3D input w) weights biases
+
+maxPool :: Array S Ix2 Float -> Array S Ix2 Float
+maxPool arr =
+    let M.Sz (Ix2 h w) = M.size arr
+        ph = h `div` 2
+        pw = w `div` 2
+    in M.makeArray M.Seq (Sz (Ix2 ph pw)) $ \(Ix2 i j) ->
+        maximum [ arr ! Ix2 (2*i + di) (2*j + dj) | di <- [0,1], dj <- [0,1], 2*i + di < h, 2*j + dj < w ]
 
 fullyConnected :: Array S Ix2 Weight -> [Bias] -> [Float] -> [Float]
 fullyConnected weights biases inputs = 
@@ -90,14 +122,18 @@ softmax xs =
         sumExp = sum expXs
     in map (/sumExp) expXs
 
-forwardPass :: Network -> Array S Ix2 Float -> ([Array S Ix2 Float], [Array S Ix2 Float], [Float], [Float])
+forwardPass :: Network -> Array S Ix2 Float -> ([Array S Ix2 Float], [Array S Ix2 Float], [Array S Ix2 Float], [Array S Ix2 Float], [Float], [Float])
 forwardPass Network{..} input = 
     let c1 = convLayer conv1Weights conv1Biases input
-        c2 = concatMap (convLayer conv2Weights conv2Biases) c1
-        flattenedC2 = concatMap M.toList c2
-        fc = fullyConnected fcWeights fcBiases flattenedC2
+        p1 = map maxPool c1
+        inputToConv2 = M.makeArray M.Seq (Sz (M.Ix3 (length p1) h w)) (\(M.Ix3 c y x) -> p1 !! c ! Ix2 y x)
+            where Sz (Ix2 h w) = M.size (head p1)
+        c2 = convLayer3D conv2Weights conv2Biases inputToConv2
+        p2 = map maxPool c2
+        flattenedP2 = concatMap M.toList p2
+        fc = fullyConnected fcWeights fcBiases flattenedP2
         output = softmax $ fullyConnected outputWeights outputBiases fc
-    in (c1, c2, fc, output)
+    in (c1, p1, c2, p2, fc, output)
 
 drawAtPoint :: (Float, Float) -> Array S Ix2 Float -> Array S Ix2 Float
 drawAtPoint (x, y) arr =
@@ -112,7 +148,7 @@ drawAtPoint (x, y) arr =
     screenToGrid :: (Float, Float) -> (Float, Float)
     screenToGrid (sx, sy) =
         ( (sx + 400) * 28 / 800
-        , (300 - sy) * 28 / 600
+        , (sy + 300) * 28 / 600
         )
 
 renderDrawingStage :: Array S Ix2 Float -> G.Picture
@@ -175,15 +211,9 @@ renderPrediction probs =
         | (p, i) <- zip probs [0..9]]
 
 handleEvent :: G.Event -> World -> World
-handleEvent (G.EventKey (G.Char key) G.Down _ _) world@World{..} =
-    case key of
-        '1' -> world { currentStage = Drawing }
-        '2' -> world { currentStage = Conv1 }
-        '3' -> world { currentStage = Conv2 }
-        '4' -> world { currentStage = FullyConnected }
-        '5' -> world { currentStage = Prediction }
-        'c' -> world { inputImage = M.makeArray M.Seq (Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float }
-        'p' -> world { shouldProcess = True }
+handleEvent (G.EventKey (G.SpecialKey G.KeyEnter) G.Down _ _) world@World{..} =
+    let nextIndex = (stageIndex + 1) `mod` length stages
+    in world { stageIndex = nextIndex, currentStage = stages !! nextIndex, shouldProcess = True }
 handleEvent (G.EventKey (G.MouseButton G.LeftButton) G.Down _ pos) world =
     world { isDrawing = True, mousePos = pos }
 handleEvent (G.EventKey (G.MouseButton G.LeftButton) G.Up _ _) world =
@@ -196,9 +226,11 @@ handleEvent _ world = world
 
 update :: Float -> World -> World
 update _ world@World{..}
-    | shouldProcess = let (c1, c2, fc, out) = forwardPass network inputImage
+    | shouldProcess = let (c1, p1, c2, p2, fc, out) = forwardPass network inputImage
                       in world { conv1Features = c1
+                               , pool1Features = p1
                                , conv2Features = c2
+                               , pool2Features = p2
                                , fcFeatures = fc
                                , outputFeatures = out
                                , shouldProcess = False
@@ -211,7 +243,9 @@ render :: World -> G.Picture
 render World{..} = case currentStage of
     Drawing -> renderDrawingStage inputImage
     Conv1 -> renderFeatureMaps conv1Features
+    Pool1 -> renderFeatureMaps pool1Features
     Conv2 -> renderFeatureMaps conv2Features
+    Pool2 -> renderFeatureMaps pool2Features
     FullyConnected -> renderFullyConnected fcFeatures
     Prediction -> renderPrediction outputFeatures
 
@@ -220,6 +254,12 @@ getConvKernel h w = do
     values <- replicateM (h * w) getFloatle
     return $ M.makeArray M.Seq (Sz (Ix2 h w)) $ \(Ix2 i j) ->
         values !! (i * w + j)
+
+getConvKernel3D :: Int -> Int -> Int -> Get (Array S Ix3 Float)
+getConvKernel3D d h w = do
+    values <- replicateM (d * h * w) getFloatle
+    return $ M.makeArray M.Seq (Sz (M.Ix3 d h w)) $ \(M.Ix3 c i j) ->
+        values !! (c * h * w + i * w + j)
 
 getArray2D :: Int -> Int -> Get (Array S Ix2 Float)
 getArray2D h w = do
@@ -244,7 +284,7 @@ decodeWeights bs =
     getNetwork = do
         conv1Weights <- replicateM 6 $ getConvKernel 5 5
         conv1Biases <- replicateM 6 getFloatle
-        conv2Weights <- replicateM 16 $ getConvKernel 5 5
+        conv2Weights <- replicateM 16 $ getConvKernel3D 6 5 5  -- Adjusted for 3D kernels
         conv2Biases <- replicateM 16 getFloatle
         fcWeights <- getArray2D 120 84
         fcBiases <- replicateM 84 getFloatle
@@ -259,17 +299,23 @@ main = do
         Left err -> putStrLn $ "Failed to load network: " ++ err
         Right net -> do
             let initialImage = M.makeArray M.Seq (Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float
+                stages = [Drawing, Conv1, Pool1, Conv2, Pool2, FullyConnected, Prediction]
                 world = World {
                     inputImage = initialImage,
                     conv1Features = [],
+                    pool1Features = [],
                     conv2Features = [],
+                    pool2Features = [],
                     fcFeatures = [],
                     outputFeatures = replicate 10 0.1,
                     network = net,
                     currentStage = Drawing,
                     mousePos = (0, 0),
                     isDrawing = False,
-                    shouldProcess = False
+                    shouldProcess = False,
+                    stageIndex = 0,
+                    stages = stages,  -- Included stages here
+                    stageDescriptions = ["Drawing", "Conv1", "Pool1", "Conv2", "Pool2", "FullyConnected", "Prediction"]
                 }
             G.play
                 (G.InWindow "CNN Visualization" (800, 600) (100, 100))
