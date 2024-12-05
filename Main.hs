@@ -15,6 +15,7 @@ import qualified Data.ByteString.Lazy as BS
 import Data.Binary
 import Data.Binary.Get
 import System.IO.Error (catchIOError)
+import Debug.Trace (trace)
 
 -- Neural Network Types
 type Weight = Float
@@ -61,20 +62,12 @@ convolve :: Array S Ix2 Float -> Array S Ix2 Float -> Array S Ix2 Float
 convolve input kernel =
     let M.Sz (Ix2 h w) = M.size input
         M.Sz (Ix2 kh kw) = M.size kernel
-        halfH = kh `div` 2
-        halfW = kw `div` 2
-        get_pixel i j
-            | i >= 0 && i < h && j >= 0 && j < w = input ! Ix2 i j
-            | otherwise = 0
-        get_kernel i j = kernel ! Ix2 i j
-    in M.makeArray M.Seq (M.Sz (Ix2 h w)) $ \(Ix2 i j) ->
-        sum [ get_pixel (i + ki - halfH) (j + kj - halfW) * get_kernel ki kj
+        outputH = h - kh + 1
+        outputW = w - kw + 1
+    in M.makeArray M.Seq (Sz (Ix2 outputH outputW)) $ \(Ix2 i j) ->
+        sum [ (input ! Ix2 (i + ki) (j + kj)) * (kernel ! Ix2 ki kj)
             | ki <- [0..kh-1]
             , kj <- [0..kw-1]
-            , let i' = i + ki - halfH
-            , let j' = j + kj - halfW
-            , i' >= 0, i' < h
-            , j' >= 0, j' < w
             ]
 
 convolve3D :: Array S Ix3 Float -> Array S Ix3 Float -> Array S Ix2 Float
@@ -83,11 +76,13 @@ convolve3D input kernel =
         M.Sz (M.Ix3 dk kh kw) = M.size kernel
         outputH = h - kh + 1
         outputW = w - kw + 1
-        get_pixel c i j = input ! M.Ix3 c i j
+        get_pixel c i j = if i >= 0 && i < h && j >= 0 && j < w
+                         then input ! M.Ix3 c i j
+                         else 0
         get_kernel c i j = kernel ! M.Ix3 c i j
     in M.makeArray M.Seq (Sz (Ix2 outputH outputW)) $ \(Ix2 i j) ->
         sum [ get_pixel c (i + ki) (j + kj) * get_kernel c ki kj
-            | c <- [0..dk-1]
+            | c <- [0..d-1]
             , ki <- [0..kh-1]
             , kj <- [0..kw-1]
             ]
@@ -106,7 +101,9 @@ maxPool arr =
         ph = h `div` 2
         pw = w `div` 2
     in M.makeArray M.Seq (Sz (Ix2 ph pw)) $ \(Ix2 i j) ->
-        maximum [ arr ! Ix2 (2*i + di) (2*j + dj) | di <- [0,1], dj <- [0,1], 2*i + di < h, 2*j + dj < w ]
+        if 2*i + 1 < h && 2*j + 1 < w
+        then maximum [ arr ! Ix2 (2*i + di) (2*j + dj) | di <- [0,1], dj <- [0,1] ]
+        else 0  -- or some other default value
 
 fullyConnected :: Array S Ix2 Weight -> [Bias] -> [Float] -> [Float]
 fullyConnected weights biases inputs = 
@@ -167,9 +164,22 @@ renderFeatureMaps features =
         rows = ceiling ((fromIntegral n :: Double) / fromIntegral cols) :: Int
         scale = min (600.0 / fromIntegral rows) (800.0 / fromIntegral cols)
         positions = [(fromIntegral x, fromIntegral y) | y <- [0..rows-1], x <- [0..cols-1]]
+        
+        -- Get dimensions of the feature maps
+        Sz (Ix2 h w) = M.size (head features)
+        
+        -- Adjust renderFeatureMap for each feature's dimensions
+        renderFeatureMap feature =
+            G.pictures 
+                [G.translate (fromIntegral x) (fromIntegral y) $
+                 G.color (G.makeColor v v v 1) $
+                 G.rectangleSolid 1 1
+                | x <- [0..w-1], y <- [0..h-1]
+                , let v = min 1.0 $ max 0.0 $ feature ! Ix2 y x]
+                
     in G.pictures 
         [G.translate (x * scale - 400.0) (y * scale - 300.0) $
-         G.scale (scale/28.0) (scale/28.0) $
+         G.scale (scale/fromIntegral w) (scale/fromIntegral h) $
          renderFeatureMap f
         | (f, (x, y)) <- zip features positions]
 
@@ -226,15 +236,20 @@ handleEvent _ world = world
 
 update :: Float -> World -> World
 update _ world@World{..}
-    | shouldProcess = let (c1, p1, c2, p2, fc, out) = forwardPass network inputImage
-                      in world { conv1Features = c1
-                               , pool1Features = p1
-                               , conv2Features = c2
-                               , pool2Features = p2
-                               , fcFeatures = fc
-                               , outputFeatures = out
-                               , shouldProcess = False
-                               }
+    | shouldProcess = 
+        let (c1, p1, c2, p2, fc, out) = forwardPass network inputImage
+            _ = trace ("Conv1 size: " ++ show (M.size (head c1))) $
+                trace ("Pool1 size: " ++ show (M.size (head p1))) $
+                trace ("Conv2 size: " ++ show (M.size (head c2))) $
+                trace ("Pool2 size: " ++ show (M.size (head p2))) $ ()
+        in world { conv1Features = c1
+                , pool1Features = p1
+                , conv2Features = c2
+                , pool2Features = p2
+                , fcFeatures = fc
+                , outputFeatures = out
+                , shouldProcess = False
+                }
     | isDrawing = let newImage = drawAtPoint mousePos inputImage
                   in world { inputImage = newImage }
     | otherwise = world
