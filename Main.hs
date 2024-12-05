@@ -1,12 +1,13 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Main where
 
 import qualified Graphics.Gloss as G
 import qualified Graphics.Gloss.Interface.Pure.Game as G
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Array, Comp(..), S, Ix2(..), Ix3(..), (!), Sz(..))
+import Data.Massiv.Array (Array, Comp(..), S, D, DI, Ix2(..), Ix3(..), (!), Sz(..))
 import qualified Data.Massiv.Array.Numeric as M
 import Control.Monad (forM_, replicateM)
 import System.Random (randomRIO)
@@ -62,26 +63,32 @@ convolve :: Array S Ix2 Float -> Array S Ix2 Float -> Array S Ix2 Float
 convolve input kernel =
     let M.Sz (Ix2 h w) = M.size input
         M.Sz (Ix2 kh kw) = M.size kernel
-        outputH = h - kh + 1
-        outputW = w - kw + 1
-    in M.makeArray M.Seq (Sz (Ix2 outputH outputW)) $ \(Ix2 i j) ->
-        sum [ (input ! Ix2 (i + ki) (j + kj)) * (kernel ! Ix2 ki kj)
-            | ki <- [0..kh-1]
-            , kj <- [0..kw-1]
-            ]
+        padH = kh `div` 2
+        padW = kw `div` 2
+        getPaddedPixel i j =
+            if i >= 0 && i < h && j >= 0 && j < w
+            then input ! Ix2 i j
+            else 0.0
+        _ = trace ("Kernel size: " ++ show (kh, kw) ++ ", max kernel val: " ++ show (M.foldlS max 0 kernel)) $ ()
+    in M.makeArray M.Seq (Sz (Ix2 h w)) $ \(Ix2 i j) ->
+        let result = sum [ (getPaddedPixel (i + ki - padH) (j + kj - padW)) * (kernel ! Ix2 ki kj)
+                        | ki <- [0..kh-1]
+                        , kj <- [0..kw-1]
+                        ]
+        in result
 
 convolve3D :: Array S Ix3 Float -> Array S Ix3 Float -> Array S Ix2 Float
 convolve3D input kernel =
     let M.Sz (M.Ix3 d h w) = M.size input
         M.Sz (M.Ix3 dk kh kw) = M.size kernel
-        outputH = h - kh + 1
-        outputW = w - kw + 1
+        padH = kh `div` 2
+        padW = kw `div` 2
         get_pixel c i j = if i >= 0 && i < h && j >= 0 && j < w
                          then input ! M.Ix3 c i j
                          else 0
         get_kernel c i j = kernel ! M.Ix3 c i j
-    in M.makeArray M.Seq (Sz (Ix2 outputH outputW)) $ \(Ix2 i j) ->
-        sum [ get_pixel c (i + ki) (j + kj) * get_kernel c ki kj
+    in M.makeArray M.Seq (Sz (Ix2 h w)) $ \(Ix2 i j) ->
+        sum [ get_pixel c (i + ki - padH) (j + kj - padW) * get_kernel c ki kj
             | c <- [0..d-1]
             , ki <- [0..kh-1]
             , kj <- [0..kw-1]
@@ -89,64 +96,157 @@ convolve3D input kernel =
 
 convLayer :: [Array S Ix2 Float] -> [Bias] -> Array S Ix2 Float -> [Array S Ix2 Float]
 convLayer weights biases input = 
-    zipWith (\w b -> M.computeS $ M.map (relu . (+b)) $ convolve input w) weights biases
+    let maxInput = M.foldlS max 0 input
+        _ = trace ("Conv layer input max: " ++ show maxInput) ()
+        results = zipWith (\(w, i) b -> 
+            let maxWeight = M.foldlS max 0 w
+                _ = trace ("Conv filter " ++ show i ++ " max weight: " ++ show maxWeight) ()
+                conv = convolve input w
+                maxConv = M.foldlS max 0 conv
+                withBias = M.computeS $ M.map (relu . (+b)) conv
+                maxResult = M.foldlS max 0 withBias
+                _ = trace ("Conv " ++ show i ++ " - before bias max: " ++ show maxConv ++ 
+                          ", after bias+relu max: " ++ show maxResult) ()
+            in withBias) (zip weights [0..]) biases
+    in results
 
 convLayer3D :: [Array S Ix3 Float] -> [Bias] -> Array S Ix3 Float -> [Array S Ix2 Float]
 convLayer3D weights biases input = 
-    zipWith (\w b -> M.computeS $ M.map (relu . (+b)) $ convolve3D input w) weights biases
+    zipWith (\w b -> 
+        let conv = convolve3D input w  -- Already returns Array S Ix2 Float
+            result = M.computeS $ M.map (relu . (+b)) conv
+        in result) weights biases
 
 maxPool :: Array S Ix2 Float -> Array S Ix2 Float
 maxPool arr =
     let M.Sz (Ix2 h w) = M.size arr
         ph = h `div` 2
         pw = w `div` 2
-    in M.makeArray M.Seq (Sz (Ix2 ph pw)) $ \(Ix2 i j) ->
-        if 2*i + 1 < h && 2*j + 1 < w
-        then maximum [ arr ! Ix2 (2*i + di) (2*j + dj) | di <- [0,1], dj <- [0,1] ]
-        else 0  -- or some other default value
+        result = M.makeArray M.Seq (Sz (Ix2 ph pw)) $ \(Ix2 i j) ->
+            if 2*i + 1 < h && 2*j + 1 < w
+            then maximum [ arr ! Ix2 (2*i + di) (2*j + dj) | di <- [0,1], dj <- [0,1] ]
+            else 0
+        maxPoolVal = M.foldlS max 0 result
+        _ = trace ("Pool max value: " ++ show maxPoolVal) $ ()
+    in result
 
 fullyConnected :: Array S Ix2 Weight -> [Bias] -> [Float] -> [Float]
 fullyConnected weights biases inputs = 
     let flatWeights = M.toList weights
+        numInputs = length inputs
         layerSize = length biases
+        maxWeight = maximum flatWeights
+        maxInput = maximum inputs
+        _ = trace ("FC layer - inputs: " ++ show (take 5 inputs) ++ "...") $ ()
         computeNeuron n = 
-            relu $ sum (zipWith (*) inputs (take (length inputs) $ drop (n * length inputs) flatWeights)) + biases !! n
+            let weights = take numInputs $ drop (n * numInputs) flatWeights
+                dotProduct = sum (zipWith (*) weights inputs)
+                result = dotProduct + biases !! n  -- Remove ReLU from final layers
+                _ = if n < 3 then
+                    trace ("Neuron " ++ show n ++ 
+                          " weights: " ++ show (take 5 weights) ++ 
+                          " dot product: " ++ show dotProduct ++ 
+                          ", bias: " ++ show (biases !! n) ++
+                          ", result: " ++ show result) $ ()
+                    else ()
+            in result
     in map computeNeuron [0..layerSize-1]
 
 softmax :: [Float] -> [Float]
 softmax xs = 
-    let expXs = map exp xs
+    let maxVal = maximum xs
+        shiftedXs = map (\x -> x - maxVal) xs
+        expXs = map exp shiftedXs
         sumExp = sum expXs
-    in map (/sumExp) expXs
+        result = map (/sumExp) expXs
+        _ = trace ("Softmax - raw input: " ++ show xs ++ 
+                  "\nShifted input: " ++ show shiftedXs ++
+                  "\nExp values: " ++ show expXs ++
+                  "\nSum exp: " ++ show sumExp ++
+                  "\nFinal output: " ++ show result) $ ()
+    in result
 
 forwardPass :: Network -> Array S Ix2 Float -> ([Array S Ix2 Float], [Array S Ix2 Float], [Array S Ix2 Float], [Array S Ix2 Float], [Float], [Float])
 forwardPass Network{..} input = 
-    let c1 = convLayer conv1Weights conv1Biases input
-        p1 = map maxPool c1
-        inputToConv2 = M.makeArray M.Seq (Sz (M.Ix3 (length p1) h w)) (\(M.Ix3 c y x) -> p1 !! c ! Ix2 y x)
+    let !inputMax = M.foldlS max 0 input
+        _ = trace ("Input max value: " ++ show inputMax) ()
+        
+        -- Ensure input has values
+        !validInput = if inputMax <= 0 
+                     then trace "WARNING: Input is all zeros!" input
+                     else input
+
+        -- Process with forced evaluation
+        !c1 = map (\(!w, !b) -> 
+                let !result = M.computeS $ M.map (relu . (+b)) $ convolve validInput w
+                    !maxVal = M.foldlS max 0 result
+                    _ = trace ("Conv1 output max: " ++ show maxVal) ()
+                in result) 
+            (zip conv1Weights conv1Biases)
+        !c1MaxVal = maximum $ map (M.foldlS max 0) c1
+        _ = trace ("CONV1 CHECK: Max conv1 value: " ++ show c1MaxVal) $ ()
+
+        !p1 = map maxPool c1
+        !p1MaxVal = maximum $ map (M.foldlS max 0) p1
+        _ = trace ("POOL1 CHECK: Max pool1 value: " ++ show p1MaxVal) $ ()
+
+        !inputToConv2 = M.computeS $ (M.makeArray M.Seq (Sz (M.Ix3 (length p1) h w)) 
+                       (\(M.Ix3 c y x) -> p1 !! c ! Ix2 y x) :: Array D Ix3 Float)
             where Sz (Ix2 h w) = M.size (head p1)
-        c2 = convLayer3D conv2Weights conv2Biases inputToConv2
-        p2 = map maxPool c2
-        flattenedP2 = concatMap M.toList p2
-        fc = fullyConnected fcWeights fcBiases flattenedP2
-        output = softmax $ fullyConnected outputWeights outputBiases fc
+
+        -- Force evaluate conv2
+        c2Raw = convLayer3D conv2Weights conv2Biases inputToConv2
+        !c2 = map (M.computeS . M.delay) c2Raw
+        !c2MaxVal = maximum $ map (M.foldlS max 0) c2
+        _ = trace ("CONV2 CHECK: Max conv2 value: " ++ show c2MaxVal) $ ()
+
+        !p2 = map maxPool c2
+        !p2MaxVal = maximum $ map (M.foldlS max 0) p2
+        _ = trace ("POOL2 CHECK: Max pool2 value: " ++ show p2MaxVal) $ ()
+
+        !flattenedP2 = concat [M.toList feature | feature <- p2]
+        !flattenedMaxVal = maximum flattenedP2
+        _ = trace ("FLATTEN CHECK: Max flattened value: " ++ show flattenedMaxVal) $ ()
+
+        -- First FC layer
+        !fc = fullyConnected fcWeights fcBiases flattenedP2
+        !fcMaxVal = maximum fc
+        _ = trace ("FC layer values: " ++ show fc) $ ()
+
+        -- Output layer (no ReLU)
+        !preOutput = fullyConnected outputWeights outputBiases fc
+        _ = trace ("Pre-softmax values: " ++ show preOutput) $ ()
+        
+        !output = softmax preOutput
+        _ = trace ("Post-softmax values: " ++ show output) $ ()
+
+        -- Force evaluation of key values
+        !_ = c1MaxVal `seq` p1MaxVal `seq` c2MaxVal `seq` p2MaxVal `seq` 
+             fcMaxVal `seq` flattenedMaxVal `seq` ()
     in (c1, p1, c2, p2, fc, output)
 
 drawAtPoint :: (Float, Float) -> Array S Ix2 Float -> Array S Ix2 Float
 drawAtPoint (x, y) arr =
-    let updatePixel (Ix2 i j) =
+    let (cx, cy) = screenToGrid (x, y)
+        newImage = M.makeArray M.Seq (M.size arr) $ \(Ix2 i j) ->
             let oldVal = arr ! Ix2 i j
-                (cx, cy) = screenToGrid (x, y)
                 dist = sqrt ((fromIntegral i - cx)^2 + (fromIntegral j - cy)^2)
-                brushValue = max 0 (1 - dist/3)
-            in max oldVal brushValue
-    in M.makeArray M.Seq (M.size arr) updatePixel :: Array S Ix2 Float
+                !brushValue = if dist < 3 then 1.0 else 0.0  -- Simplified brush
+                !newVal = max oldVal brushValue
+                !_ = if brushValue > 0 
+                     then trace ("Set pixel " ++ show (i,j) ++ " to " ++ show newVal) ()
+                     else ()
+            in newVal
+        !maxNewVal = M.foldlS max 0 newImage
+        !_ = trace ("Max value in image after drawing: " ++ show maxNewVal) ()
+    in if maxNewVal > 0 then newImage else arr
   where
     screenToGrid :: (Float, Float) -> (Float, Float)
     screenToGrid (sx, sy) =
-        ( (sx + 400) * 28 / 800
-        , (sy + 300) * 28 / 600
-        )
+        let gridX = (sx + 400) * 28 / 800
+            gridY = (sy + 300) * 28 / 600
+            _ = trace ("Converting screen " ++ show (sx, sy) ++ " to grid " ++ show (gridX, gridY)) $ ()
+        in (gridX, gridY)
 
 renderDrawingStage :: Array S Ix2 Float -> G.Picture
 renderDrawingStage img = 
@@ -210,6 +310,7 @@ renderPrediction probs =
         spacing = 20.0
         totalWidth = (barWidth + spacing) * 10.0
         maxHeight = 500.0
+        _ = trace ("Rendering predictions: " ++ show probs) $ ()
     in G.translate (-totalWidth/2.0) (-250.0) $ G.pictures
         [G.translate (fromIntegral i * (barWidth + spacing)) 0 $
          G.pictures
@@ -217,7 +318,7 @@ renderPrediction probs =
              G.rectangleSolid barWidth (p * maxHeight),
              G.translate 0 (-30.0) $
              G.scale 0.1 0.1 $
-             G.text (show i)]
+             G.text (show i ++ ": " ++ show (p * 100) ++ "%")]
         | (p, i) <- zip probs [0..9]]
 
 handleEvent :: G.Event -> World -> World
@@ -237,21 +338,42 @@ handleEvent _ world = world
 update :: Float -> World -> World
 update _ world@World{..}
     | shouldProcess = 
-        let (c1, p1, c2, p2, fc, out) = forwardPass network inputImage
-            _ = trace ("Conv1 size: " ++ show (M.size (head c1))) $
-                trace ("Pool1 size: " ++ show (M.size (head p1))) $
-                trace ("Conv2 size: " ++ show (M.size (head c2))) $
-                trace ("Pool2 size: " ++ show (M.size (head p2))) $ ()
-        in world { conv1Features = c1
-                , pool1Features = p1
-                , conv2Features = c2
-                , pool2Features = p2
-                , fcFeatures = fc
-                , outputFeatures = out
-                , shouldProcess = False
-                }
-    | isDrawing = let newImage = drawAtPoint mousePos inputImage
-                  in world { inputImage = newImage }
+        let _ = putStrLn "\n=== Starting Forward Pass ==="  -- Use putStrLn instead of trace
+            (!c1, !p1, !c2, !p2, !fc, !out) = forwardPass network inputImage
+            -- Calculate and USE the values to force evaluation
+            !maxInput = M.foldlS max 0 inputImage
+            !maxC1 = maximum $ map (M.foldlS max 0) c1
+            !maxP1 = maximum $ map (M.foldlS max 0) p1
+            !maxC2 = maximum $ map (M.foldlS max 0) c2
+            !maxP2 = maximum $ map (M.foldlS max 0) p2
+            !maxFC = maximum fc
+            !maxOut = maximum out
+
+            -- Use all the values in the output features
+            !outputFeatures' = zipWith (\x m -> 
+                                let !_ = trace ("Stage max: " ++ show m) ()
+                                in x) 
+                             out [maxInput, maxC1, maxP1, maxC2, maxP2, maxFC, maxOut]
+
+            result = world { conv1Features = c1
+                         , pool1Features = p1
+                         , conv2Features = c2
+                         , pool2Features = p2
+                         , fcFeatures = fc
+                         , outputFeatures = outputFeatures'
+                         , shouldProcess = False
+                         }
+        in result `seq` maxInput `seq` maxC1 `seq` maxP1 `seq` 
+           maxC2 `seq` maxP2 `seq` maxFC `seq` maxOut `seq` result
+
+    | isDrawing = 
+        let !newImage = drawAtPoint mousePos inputImage
+            !maxVal = M.foldlS max 0 newImage
+            -- Force maxVal evaluation
+            !resultImage = if maxVal > 0 
+                         then trace ("Max image value: " ++ show maxVal) newImage
+                         else newImage
+        in world { inputImage = resultImage }
     | otherwise = world
 
 render :: World -> G.Picture
@@ -294,25 +416,55 @@ decodeWeights :: BS.ByteString -> Either String Network
 decodeWeights bs = 
     case runGetOrFail getNetwork bs of
         Left (_, _, err) -> Left $ "Error decoding weights: " ++ err
-        Right (_, _, network) -> Right network
+        Right (_, _, network) -> 
+            let firstConv = head (conv1Weights network)
+                firstConvBias = head (conv1Biases network)
+                -- Print first 2x2 of first conv kernel
+                _ = trace ("First conv kernel 2x2: " ++ 
+                          show [ firstConv ! Ix2 i j 
+                              | i <- [0..1], j <- [0..1]]) $ ()
+                _ = trace ("First conv bias: " ++ show firstConvBias) $ ()
+                -- Print first few FC weights
+                firstFCWeights = take 5 $ M.toList (fcWeights network)
+                firstFCBias = head (fcBiases network)
+                _ = trace ("First FC weights: " ++ show firstFCWeights) $ ()
+                _ = trace ("First FC bias: " ++ show firstFCBias) $ ()
+            in Right network
   where
     getNetwork = do
         conv1Weights <- replicateM 6 $ getConvKernel 5 5
+        _ <- return $ trace ("Conv1 first kernel values: " ++ show (take 4 $ M.toList (head conv1Weights))) ()
         conv1Biases <- replicateM 6 getFloatle
-        conv2Weights <- replicateM 16 $ getConvKernel3D 6 5 5  -- Adjusted for 3D kernels
+        _ <- return $ trace ("Conv1 first bias: " ++ show (head conv1Biases)) ()
+        
+        conv2Weights <- replicateM 16 $ getConvKernel3D 6 5 5
         conv2Biases <- replicateM 16 getFloatle
+        
         fcWeights <- getArray2D 120 84
+        _ <- return $ trace ("FC first weights: " ++ show (take 5 $ M.toList fcWeights)) ()
         fcBiases <- replicateM 84 getFloatle
+        _ <- return $ trace ("FC first bias: " ++ show (head fcBiases)) ()
+        
         outputWeights <- getArray2D 84 10
         outputBiases <- replicateM 10 getFloatle
         return Network{..}
 
 main :: IO ()
 main = do
+    putStrLn "Starting program..."
     netResult <- loadNetwork "mnist_weights.bin"
     case netResult of
         Left err -> putStrLn $ "Failed to load network: " ++ err
         Right net -> do
+            let !conv1FirstKernel = head (conv1Weights net)
+                !conv1FirstBias = head (conv1Biases net)
+                !fcFirstWeight = M.foldlS max 0 (fcWeights net)
+            putStrLn $ "First conv kernel sample: " ++ show (conv1FirstKernel ! Ix2 0 0)
+            putStrLn $ "First conv bias: " ++ show conv1FirstBias
+            putStrLn $ "Max FC weight: " ++ show fcFirstWeight
+            putStrLn $ "FC Weights size: " ++ show (M.size (fcWeights net))
+            putStrLn $ "Output Weights size: " ++ show (M.size (outputWeights net))
+            putStrLn "Network loaded successfully"
             let initialImage = M.makeArray M.Seq (Sz (Ix2 28 28)) (const 0) :: Array S Ix2 Float
                 stages = [Drawing, Conv1, Pool1, Conv2, Pool2, FullyConnected, Prediction]
                 world = World {
@@ -329,9 +481,10 @@ main = do
                     isDrawing = False,
                     shouldProcess = False,
                     stageIndex = 0,
-                    stages = stages,  -- Included stages here
+                    stages = stages,
                     stageDescriptions = ["Drawing", "Conv1", "Pool1", "Conv2", "Pool2", "FullyConnected", "Prediction"]
                 }
+            putStrLn "Starting visualization..."
             G.play
                 (G.InWindow "CNN Visualization" (800, 600) (100, 100))
                 G.white
